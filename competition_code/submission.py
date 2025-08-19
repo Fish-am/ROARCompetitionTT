@@ -14,6 +14,7 @@ import roar_py_interface
 from LateralController import LatController
 from ThrottleController import ThrottleController
 import atexit
+from typing import Any
 
 # from scipy.interpolate import interp1d
 
@@ -47,6 +48,60 @@ def findClosestIndex(location, waypoints: List[roar_py_interface.RoarPyWaypoint]
             closestInd = i
     return closestInd % len(waypoints)
 
+
+def get_radius(loc1, loc2, loc3):
+    """Returns the radius of a curve given 3 points using the Menger Curvature Formula"""
+    point1 = (loc1[0], loc1[1])
+    point2 = (loc2[0], loc2[1])
+    point3 = (loc3[0], loc3[1])
+
+    side1 = round(math.dist(point1, point2), 3)
+    side2 = round(math.dist(point2, point3), 3)
+    side3 = round(math.dist(point1, point3), 3)
+
+    sp = (side1 + side2 + side3) / 2
+    area_squared = sp * (sp - side1) * (sp - side2) * (sp - side3)
+    if area_squared <= 0:
+        return 10000
+    radius = (side1 * side2 * side3) / (4 * math.sqrt(area_squared))
+    return radius
+
+
+def findCorners(track: List[roar_py_interface.RoarPyWaypoint]) -> List[Dict[str, Any]]:
+    """Detect corners by changes in heading along the original track for prediction."""
+    curAngle = track[0].roll_pitch_yaw[2]
+    angleDiffForCorner = 0.15
+    angleDiffForEnd = 0.075
+    isCorner = False
+    cornerStartIndex = None
+    corners: List[Dict[str, Any]] = []
+
+    for i in range(len(track) + 5):
+        farAngleDiff = abs(curAngle - track[(i + 8) % len(track)].roll_pitch_yaw[2])
+        shortAngleDiff = abs(curAngle - track[(i + 5) % len(track)].roll_pitch_yaw[2])
+
+        if (
+            farAngleDiff > angleDiffForCorner
+            or (shortAngleDiff > angleDiffForCorner and farAngleDiff < angleDiffForEnd)
+        ) and not isCorner:
+            cornerStartIndex = i + 2
+            isCorner = True
+        elif farAngleDiff < angleDiffForEnd and isCorner:
+            isCorner = False
+            if i - cornerStartIndex > 7:
+                cornerInfo: Dict[str, Any] = {}
+                cornerInfo["startLoc"] = track[cornerStartIndex].location
+                cornerInfo["midLoc"] = track[
+                    cornerStartIndex + round((i - cornerStartIndex) * 0.4)
+                ].location
+                cornerInfo["endLoc"] = track[i].location
+                cornerInfo["radius"] = get_radius(
+                    cornerInfo["startLoc"], cornerInfo["midLoc"], cornerInfo["endLoc"]
+                )
+                corners.append(cornerInfo)
+
+        curAngle = track[i % len(track)].roll_pitch_yaw[2]
+    return corners
 
 @atexit.register
 def saveDebugData():
@@ -95,6 +150,15 @@ class RoarCompetitionSolution:
                 np.load(f"{os.path.dirname(__file__)}\\waypoints\\waypointsPrimary.npz")
             )[35:]
         )
+
+        # Build corner prediction model from the original Monza waypoints
+        # Mandatory corner prediction (no fallback)
+        original_track = roar_py_interface.RoarPyWaypoint.load_waypoint_list(
+            np.load(
+                f"{os.path.dirname(__file__)}\\waypoints\\Monza Original Waypoints.npz"
+            )
+        )
+        self.cornerInfo = findCorners(original_track)
 
         sectionLocations = [
             [-278, 372], # Section 0 start location
@@ -178,6 +242,7 @@ class RoarCompetitionSolution:
             vehicle_location,
             current_speed_kmh,
             self.current_section,
+            self.cornerInfo,
         )
 
         steerMultiplier = round((current_speed_kmh + 0.001) / 120, 3)

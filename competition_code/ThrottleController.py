@@ -26,6 +26,7 @@ class ThrottleController:
         self.tick_counter = 0
         self.previous_speed = 1.0
         self.brake_ticks = 0
+        self.currentCorner = 0
 
         # for testing how fast the car stops
         self.brake_test_counter = 0
@@ -35,11 +36,29 @@ class ThrottleController:
         print("done")
 
     def run(
-        self, waypoints, current_location, current_speed, current_section
+        self, waypoints, current_location, current_speed, current_section, corners
     ) -> (float, float, int):
         self.tick_counter += 1
-        throttle, brake = self.get_throttle_and_brake(
-            current_location, current_speed, current_section, waypoints
+        # Strictly use corner prediction; no fallback
+        # distance to current corner start
+        distance_to_corner = np.linalg.norm(
+            current_location - corners[self.currentCorner]["startLoc"]
+        )
+
+        # advance to next corner when we pass the start
+        if distance_to_corner < 5:
+            self.currentCorner = (self.currentCorner + 1) % len(corners)
+            distance_to_corner = np.linalg.norm(
+                corners[self.currentCorner]["startLoc"] - current_location
+            )
+
+        throttle, brake = self.get_throttle_and_brake_corner(
+            current_location,
+            current_speed,
+            current_section,
+            waypoints,
+            corners[self.currentCorner],
+            distance_to_corner,
         )
         # gear = max(1, (int)(math.log(current_speed + 0.00001, 5)))
         gear = max(1, int(current_speed / 60))
@@ -58,76 +77,23 @@ class ThrottleController:
         # throttle = 0.05 * (100 - current_speed)
         return throttle, brake, gear
 
-    def get_throttle_and_brake(
-        self, current_location, current_speed, current_section, waypoints
+    # Removed curvature fallback; exclusively use corner prediction
+
+    def get_throttle_and_brake_corner(
+        self,
+        current_location,
+        current_speed,
+        current_section,
+        waypoints,
+        corner,
+        distance_to_corner,
     ):
         """
-        Returns throttle and brake values based off the car's current location and the radius of the approaching turn
+        Corner-prediction based throttle/brake: compute braking distance to meet corner target.
         """
-
-        nextWaypoint = self.get_next_interesting_waypoints(current_location, waypoints)
-        r1 = self.get_radius(nextWaypoint[self.close_index : self.close_index + 3])
-        r2 = self.get_radius(nextWaypoint[self.mid_index : self.mid_index + 3])
-        r3 = self.get_radius(nextWaypoint[self.far_index : self.far_index + 3])
-
-        target_speed1 = self.get_target_speed(r1, current_section)
-        target_speed2 = self.get_target_speed(r2, current_section)
-        target_speed3 = self.get_target_speed(r3, current_section)
-
-        close_distance = self.target_distance[self.close_index] + 3
-        mid_distance = self.target_distance[self.mid_index]
-        far_distance = self.target_distance[self.far_index]
-        speed_data = []
-        speed_data.append(
-            self.speed_for_turn(close_distance, target_speed1, current_speed)
-        )
-        speed_data.append(
-            self.speed_for_turn(mid_distance, target_speed2, current_speed)
-        )
-        speed_data.append(
-            self.speed_for_turn(far_distance, target_speed3, current_speed)
-        )
-
-        if current_speed > 100:
-            # at high speed use larger spacing between points to look further ahead and detect wide turns.
-            if current_section != 9:
-                r4 = self.get_radius(
-                    [
-                        nextWaypoint[self.mid_index],
-                        nextWaypoint[self.mid_index + 2],
-                        nextWaypoint[self.mid_index + 4],
-                    ]
-                )
-                target_speed4 = self.get_target_speed(r4, current_section)
-                speed_data.append(
-                    self.speed_for_turn(close_distance, target_speed4, current_speed)
-                )
-
-            r5 = self.get_radius(
-                [
-                    nextWaypoint[self.close_index],
-                    nextWaypoint[self.close_index + 3],
-                    nextWaypoint[self.close_index + 6],
-                ]
-            )
-            target_speed5 = self.get_target_speed(r5, current_section)
-            speed_data.append(
-                self.speed_for_turn(close_distance, target_speed5, current_speed)
-            )
-
-        update = self.select_speed(speed_data)
-
-        self.print_speed(
-            " -- SPEED: ",
-            speed_data[0].recommended_speed_now,
-            speed_data[1].recommended_speed_now,
-            speed_data[2].recommended_speed_now,
-            (0 if len(speed_data) < 4 else speed_data[3].recommended_speed_now),
-            current_speed,
-        )
-
-        throttle, brake = self.speed_data_to_throttle_and_brake(update)
-        self.dprint("--- throt " + str(throttle) + " brake " + str(brake) + "---")
+        target_speed = self.get_target_speed(corner["radius"], current_section)
+        speed_data = self.speed_for_turn(distance_to_corner, target_speed, current_speed)
+        throttle, brake = self.speed_data_to_throttle_and_brake_corner(speed_data)
         return throttle, brake
 
     def speed_data_to_throttle_and_brake(self, speed_data: SpeedData):
@@ -273,6 +239,72 @@ class ThrottleController:
                     + " throttle maintain: sp_ch="
                     + str(percent_speed_change)
                 )
+                return throttle_to_maintain, 0
+
+    def speed_data_to_throttle_and_brake_corner(self, speed_data: SpeedData):
+        """
+        Corner-aware throttle/brake policy using estimated braking distance vs remaining distance.
+        """
+        percent_of_max = speed_data.current_speed / speed_data.recommended_speed_now
+        speed_change_per_tick = 2.2
+        percent_change_per_tick = 0.075
+        true_percent_change_per_tick = round(
+            speed_change_per_tick / (speed_data.current_speed + 0.001), 5
+        )
+        speed_up_threshold = 0.9
+        throttle_decrease_multiple = 0.7
+        throttle_increase_multiple = 1.25
+
+        percent_speed_change = (speed_data.current_speed - self.previous_speed) / (
+            self.previous_speed + 0.0001
+        )
+        speed_change = round(speed_data.current_speed - self.previous_speed, 3)
+
+        # braking distance to reach recommended speed
+        braking_distance = (
+            (speed_data.recommended_speed_now / 3.6) ** 2
+            - (speed_data.current_speed / 3.6) ** 2
+        ) / (-2 * speed_change_per_tick / 3.6) / 3.5
+
+        if braking_distance > speed_data.distance_to_section:
+            if speed_data.current_speed > speed_data.recommended_speed_now:
+                if self.brake_ticks > 0:
+                    return -1, 1
+                if self.brake_ticks <= 0:
+                    self.brake_ticks = round(
+                        (speed_data.current_speed - speed_data.recommended_speed_now)
+                        / (speed_change_per_tick)
+                    )
+                    return -1, 1
+                else:
+                    self.brake_ticks = 0
+                    return 1, 0
+            else:
+                if speed_change >= 1.5:
+                    self.brake_ticks = 0
+                    return 1, 0
+
+                throttle_to_maintain = self.get_throttle_to_maintain_speed(
+                    speed_data.current_speed
+                )
+                if percent_of_max > 1.02 or percent_speed_change > (
+                    -true_percent_change_per_tick / 2
+                ):
+                    return throttle_to_maintain * throttle_decrease_multiple, 0
+                else:
+                    return throttle_to_maintain, 0
+        else:
+            self.brake_ticks = 0
+            if speed_change >= 2.75:
+                return 1, 0
+            if percent_of_max < speed_up_threshold:
+                return 1, 0
+            throttle_to_maintain = self.get_throttle_to_maintain_speed(
+                speed_data.current_speed
+            )
+            if percent_of_max < 0.98 or true_percent_change_per_tick < -0.01:
+                return throttle_to_maintain * throttle_increase_multiple, 0
+            else:
                 return throttle_to_maintain, 0
 
     # used to detect when speed is dropping due to brakes applied earlier. speed delta has a steep negative slope.
